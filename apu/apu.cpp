@@ -12,10 +12,11 @@
 #include "../snapshot.h"
 #include "../display.h"
 #include "resampler.h"
+#include "sinc_hann.h"
 
 #include "bapu/snes/snes.hpp"
 
-static const int APU_DEFAULT_INPUT_RATE = 31950; // ~59.94Hz
+static const int APU_DEFAULT_INPUT_RATE = 32040; // ~60.01Hz
 static const int APU_SAMPLE_BLOCK       = 48;
 static const int APU_NUMERATOR_NTSC     = 15664;
 static const int APU_DENOMINATOR_NTSC   = 328125;
@@ -175,7 +176,7 @@ static void UpdatePlaybackRate(void)
 
     if (Settings.MSU1)
     {
-        time_ratio = time_ratio * 44100 / 32040;
+        time_ratio = time_ratio * 44100.0 / (double)Settings.SoundInputRate;
         msu::resampler.time_ratio(time_ratio);
     }
 }
@@ -497,3 +498,10 @@ bool8 S9xSPCDump(const char *filename)
 
     return true;
 }
+
+void S9xSetResamplerType (int type)
+{
+    spc::resampler.set_interpolation(type);
+    msu::resampler.set_interpolation(type);
+}
+

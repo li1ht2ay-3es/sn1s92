@@ -53,7 +53,8 @@ static int g_screen_gun_height = SNES_HEIGHT;
 
 #define SNES_4_3 4.0f / 3.0f
 
-uint16 *screen_buffer = NULL;
+static uint32 *screen_buffer = NULL;
+static uint32 screen_pitch = 0;
 
 char g_rom_dir[1024];
 char g_basename[1024];
@@ -62,6 +63,7 @@ bool g_geometry_update = false;
 
 int hires_blend = 0;
 bool randomize_memory = false;
+int disabled_channels = 0;
 
 char retro_system_directory[4096];
 char retro_save_directory[4096];
@@ -73,14 +75,45 @@ static retro_audio_sample_batch_t audio_batch_cb = NULL;
 static retro_input_poll_t poll_cb = NULL;
 static retro_input_state_t input_state_cb = NULL;
 
+static bool libretro_supports_option_categories = false;
+static bool libretro_supports_bitmasks = false;
+
 static snes_ntsc_t *snes_ntsc = NULL;
 static int blargg_filter = 0;
 static uint16 *ntsc_screen_buffer, *snes_ntsc_buffer;
+
+static int master_volume = 100;
+static int msu1_volume = 100;
+static int color_ramp = 0;
 
 const int MAX_SNES_WIDTH_NTSC = ((SNES_NTSC_OUT_WIDTH(256) + 3) / 4) * 4;
 
 static bool show_lightgun_settings = true;
 static bool show_advanced_av_settings = true;
+
+
+static inline uint8 scale_channel(uint8 x)
+{
+    return (x << 3) | (x >> 2);
+}
+
+static inline uint8 scale_channel_curve(uint8 x)
+{
+	static const uint8 table[] = {0,6,12,20,28,36,45,56,66,76,88,100,113,125,137,149,161,172,182,192,202,210,218,225,232,238,243,247,250,252,254,255};
+	return table[x];
+}
+
+static inline uint8 scale_channel_agb(uint8 x)
+{
+	static const uint8 table[] = {0,3,8,14,20,26,33,40,47,54,62,70,78,86,94,103,112,120,129,138,147,157,166,176,185,195,205,215,225,235,245,255};
+	return table[x];
+}
+
+static inline uint8 scale_channel_sgb(uint8 x)
+{
+	static const uint8 table[] = {0,2,5,9,15,20,27,34,42,50,58,67,76,85,94,104,114,123,133,143,153,163,173,182,192,202,211,220,229,238,247,255};
+	return table[x];
+}
 
 static void extract_basename(char *buf, const char *path, size_t size)
 {
@@ -144,6 +177,8 @@ void retro_set_input_state(retro_input_state_t cb)
 enum overscan_mode {
     OVERSCAN_CROP_ON,
     OVERSCAN_CROP_OFF,
+    OVERSCAN_CROP_12,
+    OVERSCAN_CROP_16,
     OVERSCAN_CROP_AUTO
 };
 enum aspect_mode {
@@ -188,8 +223,8 @@ void retro_set_environment(retro_environment_t cb)
     };
 
     static const struct retro_subsystem_rom_info multicart_roms[] = {
-        { "Cart A", "smc|sfc|swc|fig|bs", false, false, false, multi_a_memory, 1 },
-        { "Cart B", "smc|sfc|swc|fig|bs", false, false, false, multi_b_memory, 1 },
+        { "Cart A", "smc|sfc|swc|fig|bs|st", false, false, false, multi_a_memory, 1 },
+        { "Cart B", "smc|sfc|swc|fig|bs|st", false, false, false, multi_b_memory, 1 },
     };
 
     static const struct retro_subsystem_info subsystems[] = {
@@ -199,7 +234,35 @@ void retro_set_environment(retro_environment_t cb)
 
     cb(RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO,  (void*)subsystems);
 
-    libretro_set_core_options(environ_cb);
+    /* An annoyance: retro_set_environment() can be called
+     * multiple times, and depending upon the current frontend
+     * state various environment callbacks may be disabled.
+     * This means the reported 'categories_supported' status
+     * may change on subsequent iterations. We therefore have
+     * to record whether 'categories_supported' is true on any
+     * iteration, and latch the result */
+    bool option_categories = false;
+    libretro_set_core_options(environ_cb, &option_categories);
+    libretro_supports_option_categories |= option_categories;
+
+    /* If frontend supports core option categories,
+     * show/hide toggle options are unused and should
+     * themselves be hidden */
+    if (libretro_supports_option_categories)
+    {
+        struct retro_core_option_display option_display;
+
+        option_display.visible = false;
+        option_display.key     = "snes9x_show_lightgun_settings";
+
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY,
+                &option_display);
+
+        option_display.key     = "snes9x_show_advanced_av_settings";
+
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY,
+                &option_display);
+    }
 
     static const struct retro_controller_description port_1[] = {
         { "None", RETRO_DEVICE_NONE },
@@ -339,7 +402,6 @@ static void update_variables(void)
     else
         Settings.UpAndDown = false;
 
-    int disabled_channels=0;
     strcpy(key, "snes9x_sndchan_x");
     var.key=key;
     for (int i=0;i<8;i++)
@@ -382,8 +444,12 @@ static void update_variables(void)
             Settings.InterpolationMethod = DSP_INTERPOLATION_LINEAR;
         else if (strcmp(var.value, "cubic") == 0)
             Settings.InterpolationMethod = DSP_INTERPOLATION_CUBIC;
+        else if (strcmp(var.value, "hermite") == 0)
+            Settings.InterpolationMethod = DSP_INTERPOLATION_HERMITE;
         else if (strcmp(var.value, "sinc") == 0)
             Settings.InterpolationMethod = DSP_INTERPOLATION_SINC;
+        else if (strcmp(var.value, "sinc-hann") == 0)
+            Settings.InterpolationMethod = DSP_INTERPOLATION_SINC_HANN;
         else if (strcmp(var.value, "none") == 0)
             Settings.InterpolationMethod = DSP_INTERPOLATION_NONE;
     }
@@ -433,6 +499,18 @@ static void update_variables(void)
         if (strcmp(var.value, "enabled") == 0)
             randomize_memory = true;
 
+    master_volume = 100;
+    var.key = "snes9x_volume_master";
+    var.value = NULL;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		master_volume = atoi(var.value);
+
+    msu1_volume = 100;
+    var.key = "snes9x_volume_msu1";
+    var.value = NULL;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		msu1_volume = atoi(var.value);
+
     var.key = "snes9x_overscan";
 
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -440,6 +518,10 @@ static void update_variables(void)
         overscan_mode newval = OVERSCAN_CROP_AUTO;
         if (strcmp(var.value, "enabled") == 0)
             newval = OVERSCAN_CROP_ON;
+        else if (strcmp(var.value, "12_pixels") == 0)
+            newval = OVERSCAN_CROP_12;
+        else if (strcmp(var.value, "16_pixels") == 0)
+            newval = OVERSCAN_CROP_16;
         else if (strcmp(var.value, "disabled") == 0)
             newval = OVERSCAN_CROP_OFF;
 
@@ -665,12 +747,41 @@ static void update_variables(void)
         }
     }
 
-    /* Show/hide core options */
+    var.key="snes9x_audio_resampler";
+    var.value=NULL;
+
+	S9xSetResamplerType(0);
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    {
+        if (strcmp(var.value, "hermite") == 0)
+            S9xSetResamplerType(1);
+        else if (strcmp(var.value, "sinc-hann") == 0)
+            S9xSetResamplerType(2);
+        else if (strcmp(var.value, "none") == 0)
+            S9xSetResamplerType(0);
+    }        
+
+    var.key="snes9x_gamma_ramp";
+    var.value=NULL;
+
+	color_ramp = 0;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    {
+        if (strcmp(var.value, "sameboy") == 0)
+            color_ramp = 1;
+    }
+
+
+    /* Show/hide core options
+     * > If frontend supports core option categories,
+     *   then show/hide toggle options are ignored,
+     *   and no other options should be hidden */
 
     var.key = "snes9x_show_lightgun_settings";
     var.value = NULL;
 
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    if (!libretro_supports_option_categories &&
+        environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
     {
         bool show_lightgun_settings_prev = show_lightgun_settings;
 
@@ -708,7 +819,8 @@ static void update_variables(void)
     var.key = "snes9x_show_advanced_av_settings";
     var.value = NULL;
 
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    if (!libretro_supports_option_categories &&
+        environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
     {
         bool show_advanced_av_settings_prev = show_advanced_av_settings;
 
@@ -749,6 +861,11 @@ static void update_variables(void)
     }
 }
 
+static inline int16_t short_clamp(int n)
+{
+    return (int16_t)(((int16_t)n != n) ? (n >> 31) ^ 0x7fff : n);
+}
+	
 void S9xSyncSpeed() {
 
     if (Settings.Mute) {
@@ -764,6 +881,13 @@ void S9xSyncSpeed() {
         audio_buffer.resize(avail);
 
     S9xMixSamples((uint8*)&audio_buffer[0], avail);
+
+	for( int lcv = 0; lcv < avail; lcv += 2 )
+	{
+		audio_buffer[lcv+0] = short_clamp( (audio_buffer[lcv+0] * master_volume) / 100 );
+		audio_buffer[lcv+1] = short_clamp( (audio_buffer[lcv+1] * master_volume) / 100 );
+	}
+
     audio_batch_cb(&audio_buffer[0], avail >> 1);
 }
 
@@ -776,7 +900,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #define GIT_VERSION ""
 #endif
     info->library_version = VERSION GIT_VERSION;
-    info->valid_extensions = "smc|sfc|swc|fig|bs";
+    info->valid_extensions = "smc|sfc|swc|fig|bs|st";
     info->need_fullpath = false;
     info->block_extract = false;
 }
@@ -825,15 +949,19 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
     unsigned height = PPU.ScreenHeight;
     if (crop_overscan_mode == OVERSCAN_CROP_ON)
         height = SNES_HEIGHT;
+    else if (crop_overscan_mode == OVERSCAN_CROP_12)
+        height = 216;
+    else if (crop_overscan_mode == OVERSCAN_CROP_16)
+        height = 208;
     else if (crop_overscan_mode == OVERSCAN_CROP_OFF)
         height = SNES_HEIGHT_EXTENDED;
 
     info->geometry.base_width = width;
     info->geometry.base_height = height;
-    info->geometry.max_width = MAX_SNES_WIDTH_NTSC;
+    info->geometry.max_width = MAX_SNES_WIDTH;
     info->geometry.max_height = MAX_SNES_HEIGHT;
     info->geometry.aspect_ratio = get_aspect_ratio(width, height);
-    info->timing.sample_rate = 32040;
+    info->timing.sample_rate = OVERSAMPLE;
     info->timing.fps = retro_get_region() == RETRO_REGION_NTSC ? 21477272.0 / 357366.0 : 21281370.0 / 425568.0;
 
     g_screen_gun_width = width;
@@ -1021,6 +1149,46 @@ static void init_descriptors(void)
         { 4, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT,	"Select" },
         { 4, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,		"Start" },
 
+
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,		"D-Pad Up" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,		"B" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,		"A" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,		"X" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,		"Y" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,		"L" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,		"R" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT,	"Select" },
+        { 5, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,		"Start" },
+
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,		"D-Pad Up" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,		"B" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,		"A" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,		"X" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,		"Y" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,		"L" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,		"R" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT,	"Select" },
+        { 6, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,		"Start" },
+
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,		"D-Pad Up" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,		"B" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,		"A" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,		"X" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,		"Y" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,		"L" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,		"R" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT,	"Select" },
+        { 7, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,		"Start" },
+
         { 0, 0, 0, 0, NULL },
     };
 
@@ -1134,9 +1302,9 @@ bool retro_load_game(const struct retro_game_info *game)
     if (rom_loaded)
     {
         /* If we're in RGB565 format, switch frontend to that */
-        if (RED_SHIFT_BITS == 11)
+        //if (RED_SHIFT_BITS == 11)
         {
-            enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
+            enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
             if (!environ_cb || !environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
             {
                 return false;
@@ -1150,6 +1318,13 @@ bool retro_load_game(const struct retro_game_info *game)
             srand(time(NULL));
             for(int lcv = 0; lcv < sizeof(Memory.RAM); lcv++)
                 Memory.RAM[lcv] = rand() % 256;
+        }
+
+
+        // restore disabled sound channels
+        if (disabled_channels)
+        {
+            S9xSetSoundControl(disabled_channels^0xFF);
         }
     }
 
@@ -1340,7 +1515,7 @@ void retro_init(void)
     Settings.FrameTimeNTSC = 16667;
     Settings.SixteenBitSound = TRUE;
     Settings.Stereo = TRUE;
-    Settings.SoundPlaybackRate = 32040;
+    Settings.SoundPlaybackRate = OVERSAMPLE;
     Settings.SoundInputRate = 32040;
     Settings.Transparency = TRUE;
     Settings.AutoDisplayMessages = TRUE;
@@ -1372,6 +1547,10 @@ void retro_init(void)
 
     ntsc_screen_buffer = (uint16*) calloc(1, MAX_SNES_WIDTH_NTSC * 2 * (MAX_SNES_HEIGHT + 16));
     snes_ntsc_buffer = ntsc_screen_buffer + (MAX_SNES_WIDTH_NTSC >> 1) * 16;
+
+	screen_pitch = MAX_SNES_WIDTH * 4;
+    screen_buffer = (uint32*) calloc(1, screen_pitch * (MAX_SNES_HEIGHT + 16));
+
     S9xGraphicsInit();
 
     S9xInitInputDevices();
@@ -1384,6 +1563,9 @@ void retro_init(void)
     S9xUnmapAllControls();
     map_buttons();
     check_system_specs();
+
+    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
+        libretro_supports_bitmasks = true;
 }
 
 #define MAP_BUTTON(id, name) S9xMapButton((id), S9xGetCommandT((name)), false)
@@ -1394,6 +1576,9 @@ void retro_init(void)
 #define PAD_3 3
 #define PAD_4 4
 #define PAD_5 5
+#define PAD_6 6
+#define PAD_7 7
+#define PAD_8 8
 
 #define BTN_B RETRO_DEVICE_ID_JOYPAD_B
 #define BTN_Y RETRO_DEVICE_ID_JOYPAD_Y
@@ -1511,6 +1696,44 @@ static void map_buttons()
     MAP_BUTTON(MAKE_BUTTON(PAD_5, BTN_UP), "Joypad5 Up");
     MAP_BUTTON(MAKE_BUTTON(PAD_5, BTN_DOWN), "Joypad5 Down");
 
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_A), "Joypad6 A");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_B), "Joypad6 B");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_X), "Joypad6 X");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_Y), "Joypad6 Y");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_SELECT), "Joypad6 Select");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_START), "Joypad6 Start");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_L), "Joypad6 L");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_R), "Joypad6 R");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_LEFT), "Joypad6 Left");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_RIGHT), "Joypad6 Right");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_UP), "Joypad6 Up");
+    MAP_BUTTON(MAKE_BUTTON(PAD_6, BTN_DOWN), "Joypad6 Down");
+
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_A), "Joypad7 A");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_B), "Joypad7 B");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_X), "Joypad7 X");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_Y), "Joypad7 Y");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_SELECT), "Joypad7 Select");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_START), "Joypad7 Start");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_L), "Joypad7 L");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_R), "Joypad7 R");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_LEFT), "Joypad7 Left");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_RIGHT), "Joypad7 Right");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_UP), "Joypad7 Up");
+    MAP_BUTTON(MAKE_BUTTON(PAD_7, BTN_DOWN), "Joypad7 Down");
+
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_A), "Joypad8 A");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_B), "Joypad8 B");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_X), "Joypad8 X");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_Y), "Joypad8 Y");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_SELECT), "Joypad8 Select");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_START), "Joypad8 Start");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_L), "Joypad8 L");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_R), "Joypad8 R");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_LEFT), "Joypad8 Left");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_RIGHT), "Joypad8 Right");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_UP), "Joypad8 Up");
+    MAP_BUTTON(MAKE_BUTTON(PAD_8, BTN_DOWN), "Joypad8 Down");
 }
 
 static int16_t snes_mouse_state[2][2] = {{0}, {0}};
@@ -1682,20 +1905,41 @@ static void report_buttons()
 {
     int offset = snes_devices[0] == RETRO_DEVICE_JOYPAD_MULTITAP ? 4 : 1;
     int _x, _y;
+    int16_t joy_bits;
 
     for (int port = 0; port <= 1; port++)
     {
         switch (snes_devices[port])
         {
             case RETRO_DEVICE_JOYPAD:
+                if (libretro_supports_bitmasks)
+                    joy_bits = input_state_cb(port * offset, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+                else
+                {
+                    joy_bits = 0;
+                    for (int i = 0; i < (RETRO_DEVICE_ID_JOYPAD_R3+1); i++)
+                        joy_bits |= input_state_cb(port * offset, RETRO_DEVICE_JOYPAD, 0, i) ? (1 << i) : 0;
+                }
+
                 for (int i = BTN_FIRST; i <= BTN_LAST; i++)
-                    S9xReportButton(MAKE_BUTTON(port * offset + 1, i), input_state_cb(port * offset, RETRO_DEVICE_JOYPAD, 0, i));
+                    S9xReportButton(MAKE_BUTTON(port * offset + 1, i), joy_bits & (1 << i));
                 break;
 
             case RETRO_DEVICE_JOYPAD_MULTITAP:
                 for (int j = 0; j < 4; j++)
+                {
+                    if (libretro_supports_bitmasks)
+                        joy_bits = input_state_cb(port * offset + j, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+                    else
+                    {
+                        joy_bits = 0;
+                        for (int i = 0; i < (RETRO_DEVICE_ID_JOYPAD_R3+1); i++)
+                            joy_bits |= input_state_cb(port * offset + j, RETRO_DEVICE_JOYPAD, 0, i) ? (1 << i) : 0;
+                    }
+
                     for (int i = BTN_FIRST; i <= BTN_LAST; i++)
-                        S9xReportButton(MAKE_BUTTON(port * offset + j + 1, i), input_state_cb(port * offset + j, RETRO_DEVICE_JOYPAD, 0, i));
+                        S9xReportButton(MAKE_BUTTON(port * offset + j + 1, i), joy_bits & (1 << i));
+                }
                 break;
 
             case RETRO_DEVICE_MOUSE:
@@ -1859,6 +2103,9 @@ void retro_deinit()
 
     free(screen_buffer);
     free(ntsc_screen_buffer);
+
+    libretro_supports_option_categories = false;
+    libretro_supports_bitmasks = false;
 }
 
 
@@ -1966,6 +2213,12 @@ bool retro_unserialize(const void* data, size_t size)
     if (S9xUnfreezeGameMem((const uint8_t*)data,size) != SUCCESS)
         return false;
 
+    // restore disabled sound channels
+    if (disabled_channels)
+    {
+        S9xSetSoundControl(disabled_channels^0xFF);
+    }
+
     return true;
 }
 
@@ -1985,6 +2238,32 @@ bool8 S9xDeinitUpdate(int width, int height)
         {
             overscan_offset = 7;
             height = SNES_HEIGHT;
+        }
+    }
+    else if (crop_overscan_mode == OVERSCAN_CROP_12)
+    {
+        if (height > 216 * 2)
+        {
+            overscan_offset = 8;
+            height = 216 * 2;
+        }
+        else if ((height > 216) && (height != 216 * 2))
+        {
+            overscan_offset = 4;
+            height = 216;
+        }
+    }
+    else if (crop_overscan_mode == OVERSCAN_CROP_16)
+    {
+        if (height > 208 * 2)
+        {
+            overscan_offset = 16;
+            height = 208 * 2;
+        }
+        else if ((height > 208) && (height != 208 * 2))
+        {
+            overscan_offset = 8;
+            height = 208;
         }
     }
     else if (crop_overscan_mode == OVERSCAN_CROP_OFF)
@@ -2021,11 +2300,11 @@ bool8 S9xDeinitUpdate(int width, int height)
 
         video_cb(snes_ntsc_buffer + ((int)(MAX_SNES_WIDTH_NTSC) * overscan_offset), SNES_NTSC_OUT_WIDTH(256), height, MAX_SNES_WIDTH_NTSC * 2);
     }
-    else if (width == MAX_SNES_WIDTH && hires_blend)
+    else
     {
         #define AVERAGE_565(el0, el1) (((el0) & (el1)) + ((((el0) ^ (el1)) & 0xF7DE) >> 1))
 
-        if (hires_blend == 1) /* Blur method */
+        if (width == MAX_SNES_WIDTH && hires_blend == 1) /* Blur method */
         {
             for (int y = 0; y < height; y++)
             {
@@ -2046,30 +2325,94 @@ bool8 S9xDeinitUpdate(int width, int height)
                 }
             }
         }
-        else if (hires_blend == 2) /* Merge method */
+        else if (width == MAX_SNES_WIDTH && height <= SNES_HEIGHT_EXTENDED && hires_blend == 2) /* Merge method */
         {
             for (int y = 0; y < height; y++)
             {
                 uint16 *input = (uint16 *) ((uint8 *) GFX.Screen + y * GFX.Pitch);
-                uint16 *output = (uint16 *) ((uint8 *) GFX.Screen + y * GFX.Pitch);
-                uint16 l, r;
+                uint32 *output = (uint32 *) ((uint8 *) screen_buffer + y * screen_pitch);
 
                 for (int x = 0; x < (width >> 1); x++)
                 {
-                    l = *input++;
-                    r = *input++;
-                    *output++ = AVERAGE_565 (l, r);
+                    uint16 pix1 = *input++;
+                    uint16 pix2 = *input++;
+
+					uint8 r1,g1,b1;
+					uint8 r2,g2,b2;
+
+
+					r1 = (pix1 >> 11) & 0x1f;
+					g1 = (pix1 >> 6) & 0x1f;
+					b1 = (pix1 >> 0) & 0x1f;
+
+					r2 = (pix2 >> 11) & 0x1f;
+					g2 = (pix2 >> 6) & 0x1f;
+					b2 = (pix2 >> 0) & 0x1f;
+
+
+					switch(color_ramp)
+					{
+					default:
+						r1 = (scale_channel(r1) + scale_channel(r2)) >> 1;
+						g1 = (scale_channel(g1) + scale_channel(g2)) >> 1;
+						b1 = (scale_channel(b1) + scale_channel(b2)) >> 1;
+						break;
+
+
+					case 1:
+						r1 = (scale_channel_sgb(r1) + scale_channel_sgb(r2)) >> 1;
+						g1 = (scale_channel_sgb(g1) + scale_channel_sgb(g2)) >> 1;
+						b1 = (scale_channel_sgb(b1) + scale_channel_sgb(b2)) >> 1;
+						break;
+					}
+
+                    *output++ = (r1 << 16) | (g1 << 8) | (b1 << 0);
                 }
             }
 
             width >>= 1;
         }
+		else
+		{
+            for (int y = 0; y < height; y++)
+            {
+                uint16 *input = (uint16 *) ((uint8 *) GFX.Screen + y * GFX.Pitch);
+                uint32 *output = (uint32 *) ((uint8 *) screen_buffer + y * screen_pitch);
 
-        video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
-    }
-    else
-    {
-        video_cb(GFX.Screen + ((int)(GFX.Pitch >> 1) * overscan_offset), width, height, GFX.Pitch);
+                for (int x = 0; x < width; x++)
+                {
+                    uint16 pix = *input++;
+					int r,g,b;
+
+
+					r = (pix >> 11) & 0x1f;
+					g = (pix >> 6) & 0x1f;
+					b = (pix >> 0) & 0x1f;
+
+
+					switch(color_ramp)
+					{
+					case 0:
+						r = scale_channel(r);
+						g = scale_channel(g);
+						b = scale_channel(b);
+						break;
+
+
+					default:
+						r = scale_channel_sgb(r);
+						g = scale_channel_sgb(g);
+						b = scale_channel_sgb(b);
+						break;
+					}
+
+
+                    *output++ = (r << 16) | (g << 8) | (b << 0);
+                }
+            }
+		}
+
+        video_cb(screen_buffer + ((int)(screen_pitch / 4) * overscan_offset), width, height, screen_pitch);
     }
 
     return TRUE;

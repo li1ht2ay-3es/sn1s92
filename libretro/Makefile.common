@@ -62,3 +62,5 @@ SOURCES_CXX := $(CORE_DIR)/apu/apu.cpp \
 				 $(CORE_DIR)/movie.cpp \
 				 $(CORE_DIR)/fscompat.cpp \
 				 $(CORE_DIR)/libretro/libretro.cpp
+#                                 $(CORE_DIR)/necdsp.cpp \
+#                                 $(CORE_DIR)/cx4dsp.cpp \

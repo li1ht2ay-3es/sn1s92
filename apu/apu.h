@@ -42,11 +42,24 @@ void S9xClearSamples (void);
 bool8 S9xMixSamples (uint8 *, int);
 void S9xSetSamplesAvailableCallback (apu_callback, void *);
 void S9xUpdateDynamicRate (int empty = 1, int buffer_size = 2);
+void S9xSetResamplerType (int);
 
-#define DSP_INTERPOLATION_NONE     0
-#define DSP_INTERPOLATION_LINEAR   1
-#define DSP_INTERPOLATION_GAUSSIAN 2
-#define DSP_INTERPOLATION_CUBIC    3
-#define DSP_INTERPOLATION_SINC     4
+#define DSP_INTERPOLATION_NONE       0
+#define DSP_INTERPOLATION_LINEAR     1
+#define DSP_INTERPOLATION_GAUSSIAN   2
+#define DSP_INTERPOLATION_CUBIC      3
+#define DSP_INTERPOLATION_HERMITE    4
+#define DSP_INTERPOLATION_SINC       5
+#define DSP_INTERPOLATION_SINC_HANN  6
+
+#ifdef __x86_64__
+    #define OVERSAMPLE 384000
+#elif 1
+    #define OVERSAMPLE 192000
+#else
+    #define OVERSAMPLE 32040
+#endif
+
+extern const short sinc_hann[4096 * 8];
 
 #endif

@@ -20,9 +20,10 @@ class Resampler
     volatile int start;
     int16_t *buffer;
 
+    int   r_type;
     float r_step;
     float r_frac;
-    int   r_left[4], r_right[4];
+    int   r_left[8], r_right[8];
 
     static inline int16_t short_clamp(int n)
     {
@@ -52,11 +53,31 @@ class Resampler
         return (a0 * b) + (a1 * m0) + (a2 * m1) + (a3 * c);
     }
 
+    static inline int sinc(float mu1, int s1, int s2, int s3, int s4, int s5, int s6, int s7, int s8)
+    {
+        int offset = mu1 * (float) 0x1000;
+        short const* filt = sinc_hann + offset * 8;
+        int out;
+
+        out  = filt [0] * s1;
+        out += filt [1] * s2;
+        out += filt [2] * s3;
+        out += filt [3] * s4;
+        out += filt [4] * s5;
+        out += filt [5] * s6;
+        out += filt [6] * s7;
+        out += filt [7] * s8;
+        out /= 0x8000;
+
+        return out;
+    }
+
     Resampler()
     {
         this->buffer_size = 0;
         buffer = NULL;
         r_step = 1.0;
+        r_type = 0;
     }
 
     Resampler(int num_samples)
@@ -64,12 +85,18 @@ class Resampler
         buffer = NULL;
         resize(num_samples);
         r_step = 1.0;
+        r_type = 0;
     }
 
     ~Resampler()
     {
         delete[] buffer;
         buffer = NULL;
+    }
+
+    inline void set_interpolation(int type)
+    {
+        r_type = type;
     }
 
     inline void time_ratio(double ratio)
@@ -87,8 +114,8 @@ class Resampler
         memset(buffer, 0, buffer_size * 2);
 
         r_frac = 0.0;
-        r_left[0] = r_left[1] = r_left[2] = r_left[3] = 0;
-        r_right[0] = r_right[1] = r_right[2] = r_right[3] = 0;
+        memset(r_left, 0, sizeof(r_left));
+        memset(r_right, 0, sizeof(r_right));
     }
 
     inline void dump(int num_samples)
@@ -174,31 +201,43 @@ class Resampler
         {
             int s_left = buffer[start];
             int s_right = buffer[start + 1];
-            int hermite_val[2];
+            int lerp_val[2];
 
-            while (r_frac <= 1.0 && o_position < num_samples)
+            while (r_frac < 1.0 && o_position < num_samples)
             {
-                hermite_val[0] = (int)hermite(r_frac, (float)r_left[0], (float)r_left[1], (float)r_left[2], (float)r_left[3]);
-                hermite_val[1] = (int)hermite(r_frac, (float)r_right[0], (float)r_right[1], (float)r_right[2], (float)r_right[3]);
-                data[o_position] = short_clamp(hermite_val[0]);
-                data[o_position + 1] = short_clamp(hermite_val[1]);
+                if (r_type == 1)
+                {
+                    lerp_val[0] = (int)hermite(r_frac, (float)r_left[3], (float)r_left[2], (float)r_left[1], (float)r_left[0]);
+                    lerp_val[1] = (int)hermite(r_frac, (float)r_right[3], (float)r_right[2], (float)r_right[1], (float)r_right[0]);
+                }
+                else if (r_type == 2)
+                {
+                    lerp_val[0] = sinc(r_frac, r_left[7], r_left[6], r_left[5], r_left[4], r_left[3], r_left[2], r_left[1], r_left[0]);
+                    lerp_val[1] = sinc(r_frac, r_right[7], r_right[6], r_right[5], r_right[4], r_right[3], r_right[2], r_right[1], r_right[0]);
+                }
+                else
+                {
+                    lerp_val[0] = r_left[0];
+                    lerp_val[1] = r_right[0];
+                }
+                data[o_position] = short_clamp(lerp_val[0]);
+                data[o_position + 1] = short_clamp(lerp_val[1]);
 
                 o_position += 2;
 
                 r_frac += r_step;
             }
 
-            if (r_frac > 1.0)
+            if (r_frac >= 1.0)
             {
-                r_left[0] = r_left[1];
-                r_left[1] = r_left[2];
-                r_left[2] = r_left[3];
-                r_left[3] = s_left;
+                for (int lcv = 7; lcv > 0; lcv--)
+                {
+                    r_left[lcv] = r_left[lcv-1];
+                    r_right[lcv] = r_right[lcv-1];
+                }
 
-                r_right[0] = r_right[1];
-                r_right[1] = r_right[2];
-                r_right[2] = r_right[3];
-                r_right[3] = s_right;
+                r_left[0] = s_left;
+                r_right[0] = s_right;
 
                 r_frac -= 1.0;
 

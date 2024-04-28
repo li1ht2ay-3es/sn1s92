@@ -431,13 +431,13 @@ static short const sinc [2048] =
 inline int SPC_DSP::interpolate( voice_t const* v )
 {
     int out;
-    int const* in = &v->buf [(v->interp_pos >> 12) + v->buf_pos];
+    int const* in = &v->buf [(v->interp_pos >> 12) + 4];
 
     switch (Settings.InterpolationMethod)
     {
     case 0: // raw
     {
-        out = in [0] & ~1;
+        out = in [0] & ~0;
         break;
     }
 
@@ -459,30 +459,76 @@ inline int SPC_DSP::interpolate( voice_t const* v )
         short const* fwd = cubic       + offset;
         short const* rev = cubic + 256 - offset; // mirror left half of cubic
 
-        out  = fwd [  0] * in [0];
-        out += fwd [257] * in [1];
-        out += rev [257] * in [2];
-        out += rev [  0] * in [3];
+        out  = fwd [  0] * in [-1];
+        out += fwd [257] * in [0];
+        out += rev [257] * in [1];
+        out += rev [  0] * in [2];
         out >>= 11;
 
         CLAMP16( out );
         break;
     }
 
-    case 4: // sinc filter
+    case 4: // hermite filter
+    {
+        float mu1 = (float) (v->interp_pos & 0xFFF) / 4096.0;
+        float mu2, mu3, m0, m1;
+        float a = in [-1];
+        float b = in [0];
+        float c = in [1];
+        float d = in [2];
+        float a0,a1,a2,a3;
+
+        mu2 = mu1 * mu1;
+        mu3 = mu2 * mu1;
+
+        m0 = (c - a) * 0.5;
+        m1 = (d - b) * 0.5;
+
+        a0 = +2 * mu3 - 3 * mu2 + 1;
+        a1 = mu3 - 2 * mu2 + mu1;
+        a2 = mu3 - mu2;
+        a3 = -2 * mu3 + 3 * mu2;
+
+        out = (int)((a0 * b) + (a1 * m0) + (a2 * m1) + (a3 * c));
+
+        CLAMP16( out );
+        break;
+    }
+
+    case 5: // sinc filter
     {
         int offset = (v->interp_pos & 0xFF0) >> 1;
         short const* filt = sinc + offset;
 
-        out  = filt [0] * in [0];
-        out += filt [1] * in [1];
-        out += filt [2] * in [2];
-        out += filt [3] * in [3];
-        out += filt [4] * in [4];
-        out += filt [5] * in [5];
-        out += filt [6] * in [6];
-        out += filt [7] * in [7];
+        out  = filt [0] * in [-3];
+        out += filt [1] * in [-2];
+        out += filt [2] * in [-1];
+        out += filt [3] * in [0];
+        out += filt [4] * in [1];
+        out += filt [5] * in [2];
+        out += filt [6] * in [3];
+        out += filt [7] * in [4];
         out >>= 14;
+
+        CLAMP16( out );
+        break;
+    }
+
+    case 6: // sinc filter - hann window
+    {
+        int offset = (v->interp_pos & 0xFFF) * 8;
+        short const* filt = sinc_hann + offset;
+
+        out  = filt [0] * in [-3];
+        out += filt [1] * in [-2];
+        out += filt [2] * in [-1];
+        out += filt [3] * in [0];
+        out += filt [4] * in [1];
+        out += filt [5] * in [2];
+        out += filt [6] * in [3];
+        out += filt [7] * in [4];
+        out /= 0x8000;
 
         CLAMP16( out );
         break;
@@ -496,14 +542,14 @@ inline int SPC_DSP::interpolate( voice_t const* v )
         short const* fwd = gauss + 255 - offset;
         short const* rev = gauss       + offset; // mirror left half of gaussian
 
-        out  = (fwd [  0] * in [0]) >> 11;
-        out += (fwd [256] * in [1]) >> 11;
-        out += (rev [256] * in [2]) >> 11;
-        out = (int16_t) out;
-        out += (rev [  0] * in [3]) >> 11;
+        out  = (fwd [  0] * in [-1]) >> 11;
+        out += (fwd [256] * in [0]) >> 11;
+        out += (rev [256] * in [1]) >> 11;
+        //out = (int16_t) out;
+        out += (rev [  0] * in [2]) >> 11;
 
         CLAMP16( out );
-        out &= ~1;
+        out &= ~0;
 
         break;
     }
@@ -679,8 +725,8 @@ inline void SPC_DSP::decode_brr( voice_t* v )
 
 		// Apply IIR filter (8 is the most commonly used)
 		int const filter = header & 0x0C;
-		int const p1 = pos [brr_buf_size - 1];
-		int const p2 = pos [brr_buf_size - 2] >> 1;
+		int const p1 = pos [- 1];
+		int const p2 = pos [- 2] >> 1;
 		if ( filter >= 8 )
 		{
 			s += p1;
@@ -705,7 +751,7 @@ inline void SPC_DSP::decode_brr( voice_t* v )
 		// Adjust and write sample
 		CLAMP16( s );
 		s = (int16_t) (s * 2);
-		pos [brr_buf_size] = pos [0] = s; // second copy simplifies wrap-around
+		pos [0] = s;
 	}
 }
 
@@ -798,6 +844,9 @@ inline VOICE_CLOCK( V3c )
 			m.t_brr_header = 0; // header is ignored on this sample
 			m.kon_check    = true;
 
+			// hack: clear buffer to avoid popping
+			memset(v->buf, 0, sizeof(v->buf));
+
 			if (take_spc_snapshot)
 			{
 				take_spc_snapshot = 0;
@@ -828,7 +877,7 @@ inline VOICE_CLOCK( V3c )
 			output = (int16_t) (m.noise * 2);
 
 		// Apply envelope
-		m.t_output = (output * v->env) >> 11 & ~1;
+		m.t_output = (output * v->env) >> 11 & ~0;
 		v->t_envx_out = (uint8_t) (v->env >> 4);
 	}
 
@@ -878,10 +927,28 @@ inline void SPC_DSP::voice_output( voice_t const* v, int ch )
 
 inline VOICE_CLOCK( V4 )
 {
+	// Apply pitch
+	v->interp_pos += m.t_pitch;
+
+	// Keep from getting too far ahead (when using pitch modulation)
+	if ( v->interp_pos > 0x7FFF )
+		v->interp_pos = 0x7FFF;
+
 	// Decode BRR
 	m.t_looped = 0;
 	if ( v->interp_pos >= 0x4000 )
 	{
+		// Past samples
+		v->buf[0] = v->buf[4];
+		v->buf[1] = v->buf[5];
+		v->buf[2] = v->buf[6];
+		v->buf[3] = v->buf[7];
+		v->buf[4] = v->buf[8];
+		v->buf[5] = v->buf[9];
+		v->buf[6] = v->buf[10];
+		v->buf[7] = v->buf[11];
+
+		v->buf_pos = 8;
 		decode_brr( v );
 
 		if ( (v->brr_offset += 2) >= brr_block_size )
@@ -898,12 +965,8 @@ inline VOICE_CLOCK( V4 )
 		}
 	}
 
-	// Apply pitch
-	v->interp_pos = (v->interp_pos & 0x3FFF) + m.t_pitch;
-
-	// Keep from getting too far ahead (when using pitch modulation)
-	if ( v->interp_pos > 0x7FFF )
-		v->interp_pos = 0x7FFF;
+	// Clamp
+	v->interp_pos &= 0x3FFF;
 
 	// Output left
 	voice_output( v, 0 );
@@ -1021,17 +1084,22 @@ ECHO_CLOCK( 25 )
 	int l = m.t_echo_in [0] + CALC_FIR( 6, 0 );
 	int r = m.t_echo_in [1] + CALC_FIR( 6, 1 );
 
+#if 0
 	l = (int16_t) l;
 	r = (int16_t) r;
 
 	l += (int16_t) CALC_FIR( 7, 0 );
 	r += (int16_t) CALC_FIR( 7, 1 );
+#else
+	l += CALC_FIR( 7, 0 );
+	r += CALC_FIR( 7, 1 );
+#endif
 
 	CLAMP16( l );
 	CLAMP16( r );
 
-	m.t_echo_in [0] = l & ~1;
-	m.t_echo_in [1] = r & ~1;
+	m.t_echo_in [0] = l & ~0;
+	m.t_echo_in [1] = r & ~0;
 }
 inline int SPC_DSP::echo_output( int ch )
 {
@@ -1053,8 +1121,8 @@ ECHO_CLOCK( 26 )
 	CLAMP16( l );
 	CLAMP16( r );
 
-	m.t_echo_out [0] = l & ~1;
-	m.t_echo_out [1] = r & ~1;
+	m.t_echo_out [0] = l & ~0;
+	m.t_echo_out [1] = r & ~0;
 }
 ECHO_CLOCK( 27 )
 {
