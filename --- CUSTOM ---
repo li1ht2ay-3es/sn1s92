@@ -1,0 +1,24 @@
+sound
+- interpolation = sinc-hann (8-tap, 4096 points) + hermite (4-tap)
+- interpolation = larger buffer history (sinc quality)
+- interpolation = use previous 4 samples (better clarity)
+- interpolation = clear buffer before voice on (reduce popping)
+- interpolation = move pitch update timing (accurate sampling)
+- interpolation = remove 1-bit masking (extra precision)
+- interpolation = remove pre-clamping (extra precision)
+
+- resampler = raw + sinc-hann (small post-audio clarity)
+
+
+
+libretro
+- feature = audio oversampling (192K @ 32-bit, 384K @ 64-bit)
+- feature = color correction (sameboy crt)
+- feature = hi-res transparency blending (merge, blur) [Kirby's Dreamland 3, Jurassic Park, few others]
+- feature = post-render pixel format (32-bpp)
+- feature = video cropping (larger borders)
+- feature = volume sliders (master, msu-1)
+- feature = 8-tap controller
+- feature = hardware toggling (graphics layers, sound channels)
+
+- optimize = remove blargg rendering (better shader performance)
